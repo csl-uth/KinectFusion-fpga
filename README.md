@@ -1,1 +1,1 @@
-# fpga-KinectFusion
+# KinectFusion-fpga
