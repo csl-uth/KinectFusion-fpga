@@ -39,7 +39,7 @@ The results are created inside `xclbin` directory. Software binary is named `hos
 ### Run
 For our experiments we use the living-room trajectory 2 [ICL-NUIM dataset](https://www.doc.ic.ac.uk/~ahanda/VaFRIC/iclnuim.html). We create the `.raw` format using the `scene2raw.cpp` program of the slambench1 repo. Depending on the input trajectory you must provide the necessary arguments. For instance, to run trajectory 2 (using the default parameters) you must type the command:
 
-`./host -i living_room_traj2_loop.raw -s 4.8 -p 0.34,0.5,0.24 -z 4 -c 2 -r 1 -k 481.2,480,320,240 -o output.log -x hwKernels.hw.xclbin`
+`./host -i living_room_traj2_loop.raw -s 4.8 -p 0.34,0.5,0.24 -z 4 -c 2 -r 1 -k 481.2,480,320,240 -o output.log -x hwKernels.hw.xclbin` 
 
 ### Get in Touch
 
