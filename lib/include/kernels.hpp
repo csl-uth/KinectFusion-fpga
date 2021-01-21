@@ -13,12 +13,55 @@
 #include <cstdlib>
 #include <commons.h>
 
+
+#ifndef _HW_
+#define CL_HPP_CL_1_2_DEFAULT_BUILD
+#define CL_HPP_TARGET_OPENCL_VERSION 120
+#define CL_HPP_MINIMUM_OPENCL_VERSION 120
+#define CL_HPP_ENABLE_PROGRAM_CONSTRUCTION_FROM_ARRAY_COMPATIBILITY 1
+#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#include <vector>
+#include <unistd.h>
+#include <iostream>
+#include <fstream>
+#include <CL/cl2.hpp>
+
+//OCL_CHECK doesn't work if call has templatized function call
+#define OCL_CHECK(error,call)                                       \
+    call;                                                           \
+    if (error != CL_SUCCESS) {                                      \
+      printf("%s:%d Error calling " #call ", error code is: %d\n",  \
+              __FILE__,__LINE__, error);                            \
+      exit(EXIT_FAILURE);                                           \
+    }
+
+
+	template <typename T>
+struct aligned_allocator
+{
+  using value_type = T;
+  T* allocate(std::size_t num)
+  {
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr,4096,num*sizeof(T)))
+      throw std::bad_alloc();
+    return reinterpret_cast<T*>(ptr);
+  }
+  void deallocate(T* p, std::size_t num)
+  {
+    free(p);
+  }
+};
+#endif
+
+#include "hls_half.h"
+typedef half floatH;
+
 ////////////////////////// COMPUTATION KERNELS PROTOTYPES //////////////////////
 
 void initVolumeKernel(Volume volume);
 
-void bilateralFilterKernel(float* out, const float* in, uint2 inSize,
-		const float * gaussian, float e_d, int r);
+void bilateralFilterKernel(uint2 inSize,float e_d, int r);
 
 void depth2vertexKernel(float3* vertex, const float * depth, uint2 imageSize,
 		const Matrix4 invK);
@@ -96,8 +139,9 @@ private:
 	void raycast(uint frame, const float4& k, float mu);
 
 public:
+  std::string binaryFile;
 	Kfusion(uint2 inputSize, uint3 volumeResolution, float3 volumeDimensions,
-			float3 initPose, std::vector<int> & pyramid) :
+			float3 initPose, std::vector<int> & pyramid, std::string binaryFile) :
 			computationSize(make_uint2(inputSize.x, inputSize.y)) {
 
 		this->_initPose = initPose;
@@ -115,11 +159,12 @@ public:
 
 		step = min(volumeDimensions) / max(volumeResolution);
 		viewPose = &pose;
+   this->binaryFile = binaryFile;
 		this->languageSpecificConstructor();
 	}
 //Allow a kfusion object to be created with a pose which include orientation as well as position
 	Kfusion(uint2 inputSize, uint3 volumeResolution, float3 volumeDimensions,
-			Matrix4 initPose, std::vector<int> & pyramid) :
+			Matrix4 initPose, std::vector<int> & pyramid, std::string binaryFile) :
 			computationSize(make_uint2(inputSize.x, inputSize.y)) {
 		this->_initPose = getPosition();
 		this->volumeDimensions = volumeDimensions;
@@ -134,8 +179,10 @@ public:
 
 		step = min(volumeDimensions) / max(volumeResolution);
 		viewPose = &pose;
+    this->binaryFile = binaryFile;
 		this->languageSpecificConstructor();
 	}
+
 
 	void languageSpecificConstructor();
 	~Kfusion();
@@ -191,7 +238,6 @@ public:
 	uint2 getComputationResolution() {
 		return (computationSize);
 	}
-
 };
 
 void synchroniseDevices(); // Synchronise CPU and GPU

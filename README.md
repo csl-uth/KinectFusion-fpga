@@ -1,3 +1,3 @@
-# SW-only Implementation on ARM
+# Baseline HW Configuration
 
-Unoptimized baseline implementation running on ARM with OpenMP (```THREAD_NUMBER := 4```).
+This configuration implements the three kernels (Bilateral Filter, Tracking and Integration) in HW, without optimizations. 

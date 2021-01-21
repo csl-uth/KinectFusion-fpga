@@ -11,34 +11,28 @@
 
  */
 
-#include <kernels.h>
+#include <kernels.hpp>
+#include <string.h>
+#include <omp.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-#ifdef __APPLE__
-#include <mach/clock.h>
-#include <mach/mach.h>
 
-	
-	#define TICK()    {if (print_kernel_timing) {\
-		host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &cclock);\
-		clock_get_time(cclock, &tick_clockData);\
-		mach_port_deallocate(mach_task_self(), cclock);\
-		}}
 
-	#define TOCK(str,size)  {if (print_kernel_timing) {\
-		host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &cclock);\
-		clock_get_time(cclock, &tock_clockData);\
-		mach_port_deallocate(mach_task_self(), cclock);\
-		std::cerr<< str << " ";\
-		if((tock_clockData.tv_sec > tick_clockData.tv_sec) && (tock_clockData.tv_nsec >= tick_clockData.tv_nsec))   std::cerr<< tock_clockData.tv_sec - tick_clockData.tv_sec << std::setfill('0') << std::setw(9);\
-		std::cerr  << (( tock_clockData.tv_nsec - tick_clockData.tv_nsec) + ((tock_clockData.tv_nsec<tick_clockData.tv_nsec)?1000000000:0)) << " " <<  size << std::endl;}}
-#else
-	
+//#define OLDREDUCE
+
 #define KERNEL_TIMINGS
 #ifdef KERNEL_TIMINGS
 FILE *kernel_timings_log;
 #endif
 
+#define NUM_LEVELS 3
 
+struct timespec tick_clockData;
+struct timespec tock_clockData;
+	
 #define TICK()    {if (print_kernel_timing) {clock_gettime(CLOCK_MONOTONIC, &tick_clockData);}}
 
 #ifndef KERNEL_TIMINGS
@@ -49,111 +43,542 @@ FILE *kernel_timings_log;
 #define TOCK(str,size) { if(print_kernel_timing) { clock_gettime(CLOCK_MONOTONIC, &tock_clockData);\
 							  fprintf(kernel_timings_log,"%s\t%d\t%f\t%f\n",str,size,(double) tick_clockData.tv_sec + tick_clockData.tv_nsec / 1000000000.0,(double) tock_clockData.tv_sec + tock_clockData.tv_nsec / 1000000000.0); }}
 #endif
+inline double tock() {
 
-#endif
+		struct timespec clockData;
+		clock_gettime(CLOCK_MONOTONIC, &clockData);
 
-// input once
+		return (double) clockData.tv_sec + clockData.tv_nsec / 1000000000.0;
+}	
+
+cl_uint load_file_to_memory(const char *filename, char **result)
+{
+    cl_uint size = 0;
+    FILE *f = fopen(filename, "rb");
+    if (f == NULL) {
+        *result = NULL;
+        return -1; // -1 means file opening fail
+    }
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    *result = (char *)malloc(size+1);
+    if (size != fread(*result, sizeof(char), size, f)) {
+        free(*result);
+        return -2; // -2 means file reading fail
+    }
+    fclose(f);
+    (*result)[size] = 0;
+    return size;
+}
+
 float * gaussian;
 
 // inter-frame
 Volume volume;
-float3 * vertex;
-float3 * normal;
+
+float4 *vertexF4;
+float4 *normalF4;
 
 // intra-frame
 TrackData * trackingResult;
 float* reductionoutput;
 float ** ScaledDepth;
+
+// Input depth for bilateral
 float * floatDepth;
+float * pad_depth;
+uint2  padSize;
+
 Matrix4 oldPose;
 Matrix4 raycastPose;
-float3 ** inputVertex;
-float3 ** inputNormal;
+float4 ** inputVertex;
+float4 ** inputNormal;
+
 
 bool print_kernel_timing = false;
-#ifdef __APPLE__
-	clock_serv_t cclock;
-	mach_timespec_t tick_clockData;
-	mach_timespec_t tock_clockData;
-#else
-	struct timespec tick_clockData;
-	struct timespec tock_clockData;
-#endif
-	
+
+cl_int err;
+cl_uint check_status = 0;
+
+cl_platform_id platform_id;       
+cl_platform_id platforms[16];       
+cl_uint platform_count;
+cl_uint platform_found = 0;
+char cl_platform_vendor[1001];
+
+cl_uint num_devices;
+cl_uint device_found = 0;
+cl_device_id devices[16];  
+char cl_device_name[1001];
+cl_device_id device_id;
+
+cl_context context;
+cl_command_queue q;
+cl_program program;
+cl_kernel krnl_bilateralFilterKernel;
+
+cl_mem floatDepth_buffer;
+cl_mem scaledDepth_zero_buffer;
+cl_mem gaussian_buffer;
+cl_mem pt_bf[3];
+cl_int status;
+size_t krnl_paddepth_size;
+size_t krnl_gaussian_size;
+size_t krnl_out_size;
+
+// integrate kernel variables
+cl_kernel krnl_integrateKernel;
+size_t krnl_depth_size;
+
+cl_mem volSize_buffer;
+uint4* inSize;
+cl_mem volDim_buffer;
+float4* inDim;
+
+cl_mem InvTrack_data_buffer;
+float* InvTrack_data;
+cl_mem K_data_buffer;
+float *K_data;
+
+cl_mem integrate_vol_buffer;
+short2 *integrate_vol_ptr;
+size_t krnl_vol_size;
+
+cl_mem pt_in[6];
+cl_mem pt_out[1];
+
+// track kernel variables
+cl_kernel krnl_trackKernel;
+
+cl_mem inVertex_buffer[NUM_LEVELS];
+cl_mem inNormal_buffer[NUM_LEVELS];
+
+cl_mem refVertex_buffer;
+float4* vertex;
+cl_mem refNormal_buffer;
+float4* normal;
+
+cl_mem Ttrack_data_buffer;
+float* Ttrack_data;
+cl_mem view_data_buffer;
+float* view_data;
+
+cl_mem trackData_float_buffer;
+float* trackData_float;
+cl_mem track_result_buffer;
+int* track_result_data;
+
+cl_mem pt_tr_in[6];
+cl_mem pt_tr_out[2];
+
+
 void Kfusion::languageSpecificConstructor() {
 
 	if (getenv("KERNEL_TIMINGS"))
 		print_kernel_timing = true;
-#ifdef KERNEL_TIMINGS
-	print_kernel_timing = true;
-	kernel_timings_log = fopen("kernel_timings.log","w");
-#endif
+	#ifdef KERNEL_TIMINGS
+		print_kernel_timing = true;
+		kernel_timings_log = fopen("kernel_timings.log","w");
+	#endif
+	/**********************************************
+	 * 
+	 * 			Xilinx OpenCL Initialization 
+	 * 
+	 * *********************************************/
+	err = clGetPlatformIDs(16, platforms, &platform_count);
+	if (err != CL_SUCCESS) {
+		printf("Error: Failed to find an OpenCL platform!\n");
+		printf("Test failed\n");
+		return EXIT_FAILURE;
+	}
+	printf("INFO: Found %d platforms\n", platform_count);
+	for (cl_uint iplat=0; iplat<platform_count; iplat++) {
+		err = clGetPlatformInfo(platforms[iplat], CL_PLATFORM_VENDOR, 1000, (void *)cl_platform_vendor,NULL);
+		if (err != CL_SUCCESS) {
+			printf("Error: clGetPlatformInfo(CL_PLATFORM_VENDOR) failed!\n");
+			printf("Test failed\n");
+			return EXIT_FAILURE;
+		}
+		if (strcmp(cl_platform_vendor, "Xilinx") == 0) {
+			printf("INFO: Selected platform %d from %s\n", iplat, cl_platform_vendor);
+			platform_id = platforms[iplat];
+			platform_found = 1;
+		}
+	}
+	if (!platform_found) {
+		printf("ERROR: Platform Xilinx not found. Exit.\n");
+		return EXIT_FAILURE;
+	}
+	err = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_ACCELERATOR, 16, devices, &num_devices);
+	printf("INFO: Found %d devices\n", num_devices);
+	if (err != CL_SUCCESS) {
+		printf("ERROR: Failed to create a device group!\n");
+		printf("ERROR: Test failed\n");
+		return -1;
+	}
+
+	device_id = devices[0]; // we have only one device
+
+	// ---------------------------------------------------------------
+	// Create Context
+	// ---------------------------------------------------------------
+	context = clCreateContext(0,1,&device_id,NULL,NULL,&err);
+	if (!context) {
+		printf("Error: Failed to create a compute context!\n");
+		printf("Test failed\n");
+		return EXIT_FAILURE;
+	}
+	// ---------------------------------------------------------------
+	// Create Command Queue
+	// ---------------------------------------------------------------
+	q = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &err);
+	if (!q) {
+		printf("Error: Failed to create a command q!\n");
+		printf("Error: code %i\n",err);
+		printf("Test failed\n");
+		return EXIT_FAILURE;
+	}
+	// ---------------------------------------------------------------
+	// Load Binary File from disk
+	// ---------------------------------------------------------------
+	unsigned char *kernelbinary;
+	char *xclbin = binaryFile.c_str();
+	cl_uint n_i0 = load_file_to_memory(xclbin, (char **) &kernelbinary);
+	if (n_i0 < 0) {
+		printf("failed to load kernel from xclbin: %s\n", xclbin);
+		printf("Test failed\n");
+		exit(EXIT_FAILURE);    
+	}
+	size_t n0 = n_i0;
+
+	program = clCreateProgramWithBinary(context, 1, &device_id, &n0,
+	                                (const unsigned char **) &kernelbinary, &status, &err);
+	free(kernelbinary);
+
+	if ((!program) || (err!=CL_SUCCESS)) {
+		printf("Error: Failed to create compute program from binary %d!\n", err);
+		exit(EXIT_FAILURE);
+	}
+
+	// -------------------------------------------------------------
+	//Create Kernels
+	// -------------------------------------------------------------
+	err = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+	if (err != CL_SUCCESS) {
+		size_t len;
+		char buffer[2048];
+
+		printf("Error: Failed to build program executable!\n");
+		clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+		printf("%s\n", buffer);
+		exit(EXIT_FAILURE);
+	}
+
+	krnl_bilateralFilterKernel = clCreateKernel(program, "bilateralFilterKernel", &err);
+	if (!krnl_bilateralFilterKernel || err != CL_SUCCESS) {
+		printf("Error: Failed to create compute kernel_vector_add!\n");
+		exit(EXIT_FAILURE);
+	}
+
+	krnl_integrateKernel = clCreateKernel(program, "integrateKernel", &err);
+	if (!krnl_integrateKernel || err != CL_SUCCESS) {
+		printf("Error: Failed to create compute krnl_integrateKernel!\n");
+		exit(EXIT_FAILURE);
+	}
+
+	krnl_trackKernel = clCreateKernel(program, "trackKernel", &err);
+	if (!krnl_trackKernel || err != CL_SUCCESS) {
+		printf("Error: Failed to create compute krnl_trackKernel!\n");
+		exit(EXIT_FAILURE);
+	}
+
 
 	// internal buffers to initialize
 	reductionoutput = (float*) calloc(sizeof(float) * 8 * 32, 1);
 
 	ScaledDepth = (float**) calloc(sizeof(float*) * iterations.size(), 1);
-	inputVertex = (float3**) calloc(sizeof(float3*) * iterations.size(), 1);
-	inputNormal = (float3**) calloc(sizeof(float3*) * iterations.size(), 1);
+	inputVertex = (float4**) calloc(sizeof(float4*) * iterations.size(), 1);
+	inputNormal = (float4**) calloc(sizeof(float4*) * iterations.size(), 1);
 
-	for (unsigned int i = 0; i < iterations.size(); ++i) {
+	// opencl out memory size
+	krnl_out_size = sizeof(float) * (computationSize.x * computationSize.y);
+	
+	scaledDepth_zero_buffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY,  krnl_out_size, NULL, &err);
+
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - in1" << err << std::endl;
+	}
+	ScaledDepth[0] = (float *)clEnqueueMapBuffer(q,scaledDepth_zero_buffer,true,CL_MAP_READ,0,krnl_out_size,0,nullptr,nullptr,&err);
+
+	
+	for (unsigned int i = 1; i < iterations.size(); ++i) {
 		ScaledDepth[i] = (float*) calloc(
-				sizeof(float) * (computationSize.x * computationSize.y)
-						/ (int) pow(2, i), 1);
-		inputVertex[i] = (float3*) calloc(
-				sizeof(float3) * (computationSize.x * computationSize.y)
-						/ (int) pow(2, i), 1);
-		inputNormal[i] = (float3*) calloc(
-				sizeof(float3) * (computationSize.x * computationSize.y)
-						/ (int) pow(2, i), 1);
+					sizeof(float) * (computationSize.x * computationSize.y)
+							/ (int) pow(2, i), 1);
+		
 	}
 
-	floatDepth = (float*) calloc(
-			sizeof(float) * computationSize.x * computationSize.y, 1);
-	vertex = (float3*) calloc(
-			sizeof(float3) * computationSize.x * computationSize.y, 1);
-	normal = (float3*) calloc(
-			sizeof(float3) * computationSize.x * computationSize.y, 1);
+	krnl_paddepth_size = sizeof(float)*computationSize.x*computationSize.y;
+	floatDepth_buffer = clCreateBuffer(context,  CL_MEM_READ_ONLY,  krnl_paddepth_size, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - pad_depth" << err << std::endl;
+	}
+	floatDepth = (float *)clEnqueueMapBuffer(q,floatDepth_buffer,true,CL_MAP_WRITE,0,krnl_paddepth_size,0,nullptr,nullptr,&err);
+
+
 	trackingResult = (TrackData*) calloc(
 			sizeof(TrackData) * computationSize.x * computationSize.y, 1);
 
-	// Generate the gaussian coefficient array 
 	size_t gaussianS = radius * 2 + 1;
-	gaussian = (float*) calloc(gaussianS * sizeof(float), 1);
+	krnl_gaussian_size = gaussianS * sizeof(float);
+	gaussian_buffer = clCreateBuffer(context,  CL_MEM_READ_ONLY,  krnl_gaussian_size, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - gaussian" << err << std::endl;
+	}
+
+	gaussian = (float *)clEnqueueMapBuffer(q,gaussian_buffer,true,CL_MAP_WRITE,0,krnl_gaussian_size,0,nullptr,nullptr,&err);
+	if (!(floatDepth_buffer&&gaussian_buffer&&scaledDepth_zero_buffer)) {
+		printf("Error: Failed to allocate device memory!\n");
+		exit(EXIT_FAILURE);
+	}
+
+	pt_bf[0] = floatDepth_buffer;
+	pt_bf[1] = gaussian_buffer;
+	pt_bf[2] = scaledDepth_zero_buffer;
+
+	// Generate the gaussian coefficient array
 	int x;
 	for (unsigned int i = 0; i < gaussianS; i++) {
 		x = i - 2;
 		gaussian[i] = expf(-(x * x) / (2 * delta * delta));
 	}
 
-	volume.init(volumeResolution, volumeDimensions);
+
+	for (int i = 0; i < iterations.size(); i++) {
+		size_t size = sizeof(float4) * (computationSize.x * computationSize.y)
+						/ (int) pow(2, i);
+		inVertex_buffer[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size, NULL, &err);
+		if (err != CL_SUCCESS) {
+			std::cout << "Return code for clCreateBuffer - inVertex_buffer[" << i << "]: " << err << std::endl;
+		}
+		inputVertex[i] = (float4*)clEnqueueMapBuffer(q, inVertex_buffer[i], true, CL_MAP_READ | CL_MAP_WRITE, 0, size, 0, nullptr, nullptr, &err);
+
+		inNormal_buffer[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size, NULL, &err);
+		if (err != CL_SUCCESS) {
+			std::cout << "Return code for clCreateBuffer - inNormal_buffer[" << i << "]: " << err << std::endl;
+		}
+		inputNormal[i] = (float4*)clEnqueueMapBuffer(q, inNormal_buffer[i], true, CL_MAP_READ | CL_MAP_WRITE, 0, size, 0, nullptr, nullptr, &err);
+
+	}
+
+	size_t ref_buffer_sz = sizeof(float4) * computationSize.x * computationSize.y;
+
+	refVertex_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, ref_buffer_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - refVertex_buffer: " << err << std::endl;
+	}
+	vertex = (float4*)clEnqueueMapBuffer(q, refVertex_buffer, true, CL_MAP_READ | CL_MAP_WRITE, 0, ref_buffer_sz, 0, nullptr, nullptr, &err);
+
+	refNormal_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, ref_buffer_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - refNormal_buffer: " << err << std::endl;
+	}
+	normal = (float4*)clEnqueueMapBuffer(q, refNormal_buffer, true, CL_MAP_READ | CL_MAP_WRITE, 0, ref_buffer_sz, 0, nullptr, nullptr, &err);
+
+	size_t trackFloat_sz = 7*sizeof(float)*computationSize.x * computationSize.y;
+	trackData_float_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, trackFloat_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - trackData_float_buffer" << err << std::endl;
+	}
+	trackData_float = (float *)clEnqueueMapBuffer(q,trackData_float_buffer,true,CL_MAP_READ | CL_MAP_WRITE,0,trackFloat_sz,0,nullptr,nullptr,&err);
+	
+	size_t result_buffer_sz = sizeof(int)*computationSize.x * computationSize.y;
+	track_result_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, result_buffer_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - track_result_buffer" << err << std::endl;
+	}
+	track_result_data = (int *)clEnqueueMapBuffer(q,track_result_buffer,true,CL_MAP_READ | CL_MAP_WRITE,0,result_buffer_sz,0,nullptr,nullptr,&err);
+    
+	size_t matrix_sz = 16*sizeof(float);
+	Ttrack_data_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, matrix_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - Ttrack_data_buffer" << err << std::endl;
+	}
+	Ttrack_data = (float *)clEnqueueMapBuffer(q,Ttrack_data_buffer,true,CL_MAP_WRITE,0,matrix_sz,0,nullptr,nullptr,&err);
+
+	view_data_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, matrix_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - view_data_buffer" << err << std::endl;
+	}
+	view_data = (float *)clEnqueueMapBuffer(q,view_data_buffer,true,CL_MAP_WRITE,0,matrix_sz,0,nullptr,nullptr,&err);
+	
+
+	/**** integrate kernel buffers ****/
+
+	krnl_vol_size = volumeResolution.x * volumeResolution.y *volumeResolution.z*sizeof(short2);
+	
+	integrate_vol_buffer = clCreateBuffer(context,  CL_MEM_READ_WRITE,  krnl_vol_size, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - integrate_vol_buffer" << err << std::endl;
+	}
+	integrate_vol_ptr = (short2 *)clEnqueueMapBuffer(q,integrate_vol_buffer,true,CL_MAP_READ | CL_MAP_WRITE,0,krnl_vol_size,0,nullptr,nullptr,&err);
+
+	volSize_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint4), NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - volSize_buffer" << err << std::endl;
+	}
+	inSize = (uint4 *)clEnqueueMapBuffer(q,volSize_buffer,true,CL_MAP_WRITE,0,sizeof(uint4),0,nullptr,nullptr,&err);
+
+
+	volDim_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY,  sizeof(float4), NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - volDim_buffer" << err << std::endl;
+	}
+	inDim = (float4 *)clEnqueueMapBuffer(q,volDim_buffer,true,CL_MAP_WRITE,0,sizeof(float4),0,nullptr,nullptr,&err);
+
+	matrix_sz = 16*sizeof(float);
+	InvTrack_data_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, matrix_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - InvTrack_data_buffer" << err << std::endl;
+	}
+	InvTrack_data = (float *)clEnqueueMapBuffer(q,InvTrack_data_buffer,true,CL_MAP_WRITE,0,matrix_sz,0,nullptr,nullptr,&err);
+
+
+	K_data_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, matrix_sz, NULL, &err);
+	if (err != CL_SUCCESS) {
+		std::cout << "Return code for clCreateBuffer - K_data_buffer" << err << std::endl;
+	}
+	K_data = (float *)clEnqueueMapBuffer(q,K_data_buffer,true,CL_MAP_WRITE,0,matrix_sz,0,nullptr,nullptr,&err);
+	
+	clFinish(q);
+	volume.init(volumeResolution, volumeDimensions,integrate_vol_ptr);
+
+	
 	reset();
 }
 
+// destructor
 Kfusion::~Kfusion() {
-
-	free(floatDepth);
-	free(trackingResult);
 #ifdef KERNEL_TIMINGS
 	fclose(kernel_timings_log);
 #endif
+	// Cleanup OpenCL objects
+	for (int i = 0; i < iterations.size(); i++) {
+		err = clEnqueueUnmapMemObject(q,inVertex_buffer[i],inputVertex[i],0,NULL,NULL);
+		if(err != CL_SUCCESS){
+			printf("Error: Failed to unmap device memory inVertex_buffer[%d]!\n", i);
+		}
+
+		err = clEnqueueUnmapMemObject(q,inNormal_buffer[i],inputNormal[i],0,NULL,NULL);
+		if(err != CL_SUCCESS){
+			printf("Error: Failed to unmap device memory inNormal_buffer[%d]!\n", i);
+		}
+	}
+
+	err = clEnqueueUnmapMemObject(q,refVertex_buffer,vertex,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory refVertex_buffer!\n");
+	}
+
+	err = clEnqueueUnmapMemObject(q,refNormal_buffer,normal,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory refNormal_buffer!\n");
+	}
+
+	err = clEnqueueUnmapMemObject(q,trackData_float_buffer,trackData_float,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory trackData_float_buffer!\n");
+	}
+
+	err = clEnqueueUnmapMemObject(q,Ttrack_data_buffer,Ttrack_data,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory Ttrack_data_buffer!\n");
+	}
+
+	err = clEnqueueUnmapMemObject(q,view_data_buffer,view_data,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory view_data_buffer!\n");
+	}
+
+	clReleaseMemObject(refVertex_buffer);
+	clReleaseMemObject(refNormal_buffer);
+	clReleaseMemObject(trackData_float_buffer);
+
+	clReleaseMemObject(Ttrack_data_buffer);
+	clReleaseMemObject(view_data_buffer);
+
+	
+	err = clEnqueueUnmapMemObject(q,floatDepth_buffer,floatDepth,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory floatDepth_buffer!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,gaussian_buffer,gaussian,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory floatDepth_buffer!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,scaledDepth_zero_buffer,ScaledDepth[0],0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory floatDepth_buffer!\n");
+	}
+	clReleaseMemObject(floatDepth_buffer);
+	clReleaseMemObject(gaussian_buffer);
+	clReleaseMemObject(scaledDepth_zero_buffer);
+
+	err = clEnqueueUnmapMemObject(q,integrate_vol_buffer,integrate_vol_ptr,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory integrate_vol_buffer!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,volSize_buffer,inSize,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory volSize_buffer!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,volDim_buffer,inDim,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory volDim_buffer!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,InvTrack_data_buffer,InvTrack_data,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory InvTrack_data!\n");
+	}
+	err = clEnqueueUnmapMemObject(q,K_data_buffer,K_data,0,NULL,NULL);
+	if(err != CL_SUCCESS){
+		printf("Error: Failed to unmap device memory K_data!\n");
+	}
+
+	clReleaseMemObject(volSize_buffer);
+	clReleaseMemObject(volDim_buffer);
+	clReleaseMemObject(InvTrack_data_buffer);
+	clReleaseMemObject(K_data_buffer);
+
+	clReleaseMemObject(integrate_vol_buffer);
+
+	clReleaseProgram(program);
+    clReleaseKernel(krnl_bilateralFilterKernel);
+    clReleaseKernel(krnl_integrateKernel);
+    clReleaseKernel(krnl_trackKernel);
+
+
+    clReleaseCommandQueue(q);
+    clReleaseContext(context);
+
+	free(floatDepth);
+	free(trackingResult);
 
 	free(reductionoutput);
 	for (unsigned int i = 0; i < iterations.size(); ++i) {
-		free(ScaledDepth[i]);
-		free(inputVertex[i]);
-		free(inputNormal[i]);
+		if(i!=0){
+			free(ScaledDepth[i]);
+		}
 	}
 	free(ScaledDepth);
 	free(inputVertex);
 	free(inputNormal);
 
-	free(vertex);
-	free(normal);
-	free(gaussian);
-
 	volume.release();
+
 }
+
 void Kfusion::reset() {
 	initVolumeKernel(volume);
 }
@@ -178,75 +603,67 @@ void initVolumeKernel(Volume volume) {
 	TOCK("initVolumeKernel", volume.size.x * volume.size.y * volume.size.z);
 }
 
-void bilateralFilterKernel(float* out, const float* in, uint2 size,
-		const float * gaussian, float e_d, int r) {
-	TICK()
-		uint y;
-		float e_d_squared_2 = e_d * e_d * 2;
+void bilateralFilterKernel(float* out, float* in, uint size_x, uint size_y,
+		const float * gaussian, float e_d, int r){
 
-		#pragma omp parallel for schedule(dynamic) \
-	    		shared(out),private(y)   
-		for (y = 0; y < size.y; y++) {
-			for (uint x = 0; x < size.x; x++) {
-				uint pos = x + y * size.x;
-				if (in[pos] == 0) {
-					out[pos] = 0;
-					continue;
-				}
+	TICK();
+	/** Set arguments ***/
+	err = 0;
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 0, sizeof(cl_mem), &scaledDepth_zero_buffer);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 1, sizeof(cl_mem), &floatDepth_buffer);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 2, sizeof(uint),&size_x);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 3, sizeof(uint),&size_y);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 4, sizeof(cl_mem), &gaussian_buffer);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 5, sizeof(float), &e_d);
+	err |= clSetKernelArg(krnl_bilateralFilterKernel, 6, sizeof(int), &r);
 
-				float sum = 0.0f;
-				float t = 0.0f;
+	if (err != CL_SUCCESS) {
+		printf("Error: Failed to set kernel_vector_add arguments! %d\n", err);
+	}
+	err = clEnqueueMigrateMemObjects(q,(cl_uint)2,pt_bf, 0 ,0,NULL, NULL);
 
-				const float center = in[pos];
 
-				for (int i = -r; i <= r; ++i) {
-					for (int j = -r; j <= r; ++j) {
-						uint2 curPos = make_uint2(clamp(x + i, 0u, size.x - 1),
-								clamp(y + j, 0u, size.y - 1));
-						const float curPix = in[curPos.x + curPos.y * size.x];
-						if (curPix > 0) {
-							const float mod = sq(curPix - center);
-							const float factor = gaussian[i + r]
-									* gaussian[j + r]
-									* expf(-mod / e_d_squared_2);
-							t += factor * curPix;
-							sum += factor;
-						}
-					}
-				}
-				out[pos] = t / sum;
-			}
-		}
-		TOCK("bilateralFilterKernel", size.x * size.y);
+	err = clEnqueueTask(q, krnl_bilateralFilterKernel, 0, NULL, NULL);
+	if (err) {
+		printf("Error: Failed to execute kernel! %d\n", err);
+		return EXIT_FAILURE;
+	}
+	err = 0;
+	err |= clEnqueueMigrateMemObjects(q,(cl_uint)1,&pt_bf[2], CL_MIGRATE_MEM_OBJECT_HOST,0,NULL, NULL);
+	if (err != CL_SUCCESS) {
+		printf("Error: Failed to write to source array: %d!\n", err);
+		return EXIT_FAILURE;
+	}
+
+	clFinish(q);
+	TOCK("bilateralFilterKernel",krnl_paddepth_size);
 }
 
-void depth2vertexKernel(float3* vertex, const float * depth, uint2 imageSize,
+void depth2vertexKernel(float4* vertex, const float * depth, uint2 imageSize,
 		const Matrix4 invK) {
 	TICK();
 	unsigned int x, y;
-
-	#pragma omp parallel for schedule(dynamic) \
-    	     shared(vertex), private(x, y)
+	#pragma omp parallel for \
+         shared(vertex), private(x, y)
 	for (y = 0; y < imageSize.y; y++) {
 		for (x = 0; x < imageSize.x; x++) {
 
 			if (depth[x + y * imageSize.x] > 0) {
-				vertex[x + y * imageSize.x] = depth[x + y * imageSize.x]
-						* (rotate(invK, make_float3(x, y, 1.f)));
+				vertex[x + y * imageSize.x] = make_float4(depth[x + y * imageSize.x]
+						* (rotate(invK, make_float3(x, y, 1.f))));
 			} else {
-				vertex[x + y * imageSize.x] = make_float3(0);
+				vertex[x + y * imageSize.x] = make_float4(0);
 			}
 		}
 	}
 	TOCK("depth2vertexKernel", imageSize.x * imageSize.y);
 }
 
-void vertex2normalKernel(float3 * out, const float3 * in, uint2 imageSize) {
+void vertex2normalKernel(float4 * out, const float4 * in, uint2 imageSize) {
 	TICK();
 	unsigned int x, y;
-
-	#pragma omp parallel for schedule(dynamic) \
-    	    shared(out), private(x,y)
+	#pragma omp parallel for \
+        shared(out), private(x,y)
 	for (y = 0; y < imageSize.y; y++) {
 		for (x = 0; x < imageSize.x; x++) {
 			const uint2 pleft = make_uint2(max(int(x) - 1, 0), y);
@@ -256,18 +673,18 @@ void vertex2normalKernel(float3 * out, const float3 * in, uint2 imageSize) {
 			const uint2 pdown = make_uint2(x,
 					min(y + 1, ((int) imageSize.y) - 1));
 
-			const float3 left = in[pleft.x + imageSize.x * pleft.y];
-			const float3 right = in[pright.x + imageSize.x * pright.y];
-			const float3 up = in[pup.x + imageSize.x * pup.y];
-			const float3 down = in[pdown.x + imageSize.x * pdown.y];
+			const float4 left = in[pleft.x + imageSize.x * pleft.y];
+			const float4 right = in[pright.x + imageSize.x * pright.y];
+			const float4 up = in[pup.x + imageSize.x * pup.y];
+			const float4 down = in[pdown.x + imageSize.x * pdown.y];
 
 			if (left.z == 0 || right.z == 0 || up.z == 0 || down.z == 0) {
 				out[x + y * imageSize.x].x = KFUSION_INVALID;
 				continue;
 			}
-			const float3 dxv = right - left;
-			const float3 dyv = down - up;
-			out[x + y * imageSize.x] = normalize(cross(dyv, dxv)); // switched dx and dy to get factor -1
+			const float3 dxv = make_float3(right - left);
+			const float3 dyv = make_float3(down - up);
+			out[x + y * imageSize.x] = make_float4(normalize(cross(dyv, dxv))); // switched dx and dy to get factor -1
 		}
 	}
 	TOCK("vertex2normalKernel", imageSize.x * imageSize.y);
@@ -317,8 +734,8 @@ void new_reduce(int blockIndex, float * out, TrackData* J, const uint2 Jsize,
 	sums29 = 0.0f;
 	sums30 = 0.0f;
 	sums31 = 0.0f;
-// comment me out to try coarse grain parallelism 
-#pragma omp parallel for schedule(dynamic) reduction(+:sums0,sums1,sums2,sums3,sums4,sums5,sums6,sums7,sums8,sums9,sums10,sums11,sums12,sums13,sums14,sums15,sums16,sums17,sums18,sums19,sums20,sums21,sums22,sums23,sums24,sums25,sums26,sums27,sums28,sums29,sums30,sums31)
+	// comment me out to try coarse grain parallelism 
+	#pragma omp parallel for reduction(+:sums0,sums1,sums2,sums3,sums4,sums5,sums6,sums7,sums8,sums9,sums10,sums11,sums12,sums13,sums14,sums15,sums16,sums17,sums18,sums19,sums20,sums21,sums22,sums23,sums24,sums25,sums26,sums27,sums28,sums29,sums30,sums31)
 	for (uint y = blockIndex; y < size.y; y += 8) {
 		for (uint x = 0; x < size.x; x++) {
 
@@ -417,12 +834,12 @@ void reduceKernel(float * out, TrackData* J, const uint2 Jsize,
 		const uint2 size) {
 	TICK();
 	int blockIndex;
-#ifdef OLDREDUCE
-#pragma omp parallel for schedule(dynamic) private (blockIndex)
-#endif
+	#ifdef OLDREDUCE
+	#pragma omp parallel for private (blockIndex)
+	#endif
 	for (blockIndex = 0; blockIndex < 8; blockIndex++) {
 
-#ifdef OLDREDUCE
+	#ifdef OLDREDUCE
 		float S[112][32]; // this is for the final accumulation
 		// we have 112 threads in a blockdim
 		// and 8 blocks in a gridDim?
@@ -503,9 +920,9 @@ void reduceKernel(float * out, TrackData* J, const uint2 Jsize,
 			}
 			out[ssline+blockIndex*32] = S[0][ssline];
 		}
-#else 
+	#else 
 		new_reduce(blockIndex, out, J, Jsize, size);
-#endif
+	#endif
 
 	}
 
@@ -524,9 +941,8 @@ void trackKernel(TrackData* output, const float3* inVertex,
 	TICK();
 	uint2 pixel = make_uint2(0, 0);
 	unsigned int pixely, pixelx;
-
-	#pragma omp parallel for schedule(dynamic) \
-		    shared(output), private(pixel,pixelx,pixely)
+	#pragma omp parallel for \
+	    shared(output), private(pixel,pixelx,pixely)
 	for (pixely = 0; pixely < inSize.y; pixely++) {
 		for (pixelx = 0; pixelx < inSize.x; pixelx++) {
 			pixel.x = pixelx;
@@ -601,15 +1017,13 @@ void mm2metersKernel(float * out, uint2 outSize, const ushort * in,
 
 	int ratio = inSize.x / outSize.x;
 	unsigned int y;
-
-	#pragma omp parallel for schedule(dynamic) \
-			shared(out), private(y)
+	#pragma omp parallel for \
+        shared(out), private(y)
 	for (y = 0; y < outSize.y; y++)
 		for (unsigned int x = 0; x < outSize.x; x++) {
 			out[x + outSize.x * y] = in[x * ratio + inSize.x * y * ratio]
 					/ 1000.0f;
 		}
-
 	TOCK("mm2metersKernel", outSize.x * outSize.y);
 }
 
@@ -618,7 +1032,7 @@ void halfSampleRobustImageKernel(float* out, const float* in, uint2 inSize,
 	TICK();
 	uint2 outSize = make_uint2(inSize.x / 2, inSize.y / 2);
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
         shared(out), private(y)
 	for (y = 0; y < outSize.y; y++) {
 		for (unsigned int x = 0; x < outSize.x; x++) {
@@ -650,51 +1064,84 @@ void halfSampleRobustImageKernel(float* out, const float* in, uint2 inSize,
 	TOCK("halfSampleRobustImageKernel", outSize.x * outSize.y);
 }
 
-void integrateKernel(Volume vol, const float* depth, uint2 depthSize,
-		const Matrix4 invTrack, const Matrix4 K, const float mu,
-		const float maxweight) {
+
+void integrateKernel(Volume vol, float* depth, uint2 depthSize,
+		Matrix4 invTrack, Matrix4 K, float mu,
+		float maxweight) {
+
 	TICK();
-	const float3 delta = rotate(invTrack,
-			make_float3(0, 0, vol.dim.z / vol.size.z));
-	const float3 cameraDelta = rotate(K, delta);
-	unsigned int y;
+    int argcounter = 0;
+	int start = 0;
+	int end = 256;
 
-	#pragma omp parallel for schedule(dynamic) \
-			shared(vol), private(y)
-	for (y = 0; y < vol.size.y; y++)
-		for (unsigned int x = 0; x < vol.size.x; x++) {
+	pt_out[0] = integrate_vol_buffer;
 
-			uint3 pix = make_uint3(x, y, 0); //pix.x = x;pix.y = y;
-			float3 pos = invTrack * vol.pos(pix);
-			float3 cameraX = K * pos;
+	pt_in[0] = volSize_buffer;
+	pt_in[1] = integrate_vol_buffer;
+	pt_in[2] = volDim_buffer;
+	pt_in[3] = floatDepth_buffer;
+	pt_in[4] = InvTrack_data_buffer;
+	pt_in[5] = K_data_buffer;
 
-			for (pix.z = 0; pix.z < vol.size.z;
-					++pix.z, pos += delta, cameraX += cameraDelta) {
-				if (pos.z < 0.0001f) // some near plane constraint
-					continue;
-				const float2 pixel = make_float2(cameraX.x / cameraX.z + 0.5f,
-						cameraX.y / cameraX.z + 0.5f);
-				if (pixel.x < 0 || pixel.x > depthSize.x - 1 || pixel.y < 0
-						|| pixel.y > depthSize.y - 1)
-					continue;
-				const uint2 px = make_uint2(pixel.x, pixel.y);
-				if (depth[px.x + px.y * depthSize.x] == 0)
-					continue;
-				const float diff =
-						(depth[px.x + px.y * depthSize.x] - cameraX.z)
-								* std::sqrt(
-										1 + sq(pos.x / pos.z)
-												+ sq(pos.y / pos.z));
-				if (diff > -mu) {
-					const float sdf = fminf(1.f, diff / mu);
-					float2 data = vol[pix];
-					data.x = clamp((data.y * data.x + sdf) / (data.y + 1), -1.f,
-							1.f);
-					data.y = fminf(data.y + 1, maxweight);
-					vol.set(pix, data);
-				}
-			}
-		}
+	// before migration
+	inSize->x = volume.size.x;
+	inSize->y = volume.size.y;
+	inSize->z = volume.size.z;
+
+	inDim->x = volume.dim.x;
+	inDim->y = volume.dim.y;
+	inDim->z = volume.dim.z;
+
+	#pragma omp parallel for
+	for (int i = 0; i < 4; i ++) {
+		InvTrack_data[i*4] = invTrack.data[i].x;
+		InvTrack_data[i*4 + 1] = invTrack.data[i].y;
+		InvTrack_data[i*4 + 2] = invTrack.data[i].z;
+		InvTrack_data[i*4 + 3] = invTrack.data[i].w;
+
+		K_data[i*4] = K.data[i].x;
+		K_data[i*4 + 1] = K.data[i].y;
+		K_data[i*4 + 2] = K.data[i].z;
+		K_data[i*4 + 3] = K.data[i].w;
+	}
+
+
+  	err = 0;
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &volSize_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &integrate_vol_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &integrate_vol_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &volDim_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &floatDepth_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(int), &depthSize.x);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(int), &depthSize.y);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &InvTrack_data_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(cl_mem), &K_data_buffer);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(float), &mu);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(float), &maxweight);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(int), &start);
+	err |= clSetKernelArg(krnl_integrateKernel,argcounter++, sizeof(int), &end);
+	if (err != CL_SUCCESS) {
+		printf("Error: Failed to set krnl_integrateKernel arguments! %d\n", err);
+ 
+ 	}
+	err = clEnqueueMigrateMemObjects(q,(cl_uint)6, pt_in, 0 ,0,NULL, NULL);
+
+	
+	err = clEnqueueTask(q, krnl_integrateKernel, 0, NULL, NULL);
+    if (err) {
+        printf("Error: Failed to execute kernel! %d\n", err);
+        return EXIT_FAILURE;
+    }	
+    
+	err = 0;
+	err |= clEnqueueMigrateMemObjects(q,(cl_uint)1, pt_out, CL_MIGRATE_MEM_OBJECT_HOST,0,NULL, NULL);
+	if (err != CL_SUCCESS) {
+        printf("Error: Failed to write to source array: %d!\n", err);
+        return EXIT_FAILURE;
+    }
+
+	clFinish(q);
+	
 	TOCK("integrateKernel", vol.size.x * vol.size.y);
 }
 
@@ -751,12 +1198,13 @@ float4 raycast(const Volume volume, const uint2 pos, const Matrix4 view,
 	return make_float4(0);
 
 }
-void raycastKernel(float3* vertex, float3* normal, uint2 inputSize,
+
+void raycastKernel(float4* vertex, float4* normal, uint2 inputSize,
 		const Volume integration, const Matrix4 view, const float nearPlane,
 		const float farPlane, const float step, const float largestep) {
 	TICK();
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
 	    shared(normal, vertex), private(y)
 	for (y = 0; y < inputSize.y; y++)
 		for (unsigned int x = 0; x < inputSize.x; x++) {
@@ -766,23 +1214,24 @@ void raycastKernel(float3* vertex, float3* normal, uint2 inputSize,
 			const float4 hit = raycast(integration, pos, view, nearPlane,
 					farPlane, step, largestep);
 			if (hit.w > 0.0) {
-				vertex[pos.x + pos.y * inputSize.x] = make_float3(hit);
+				vertex[pos.x + pos.y * inputSize.x] = hit;
 				float3 surfNorm = integration.grad(make_float3(hit));
 				if (length(surfNorm) == 0) {
 					//normal[pos] = normalize(surfNorm); // APN added
 					normal[pos.x + pos.y * inputSize.x].x = KFUSION_INVALID;
 				} else {
-					normal[pos.x + pos.y * inputSize.x] = normalize(surfNorm);
+					normal[pos.x + pos.y * inputSize.x] = make_float4(normalize(surfNorm));
 				}
 			} else {
 				//std::cerr<< "RAYCAST MISS "<<  pos.x << " " << pos.y <<"  " << hit.w <<"\n";
-				vertex[pos.x + pos.y * inputSize.x] = make_float3(0);
-				normal[pos.x + pos.y * inputSize.x] = make_float3(KFUSION_INVALID, 0,
-						0);
+				vertex[pos.x + pos.y * inputSize.x] = make_float4(0);
+				normal[pos.x + pos.y * inputSize.x] = make_float4(KFUSION_INVALID, 0,
+						0,0);
 			}
 		}
 	TOCK("raycastKernel", inputSize.x * inputSize.y);
 }
+
 
 bool updatePoseKernel(Matrix4 & pose, const float * output,
 		float icp_threshold) {
@@ -822,7 +1271,7 @@ bool checkPoseKernel(Matrix4 & pose, Matrix4 oldPose, const float * output,
 void renderNormalKernel(uchar3* out, const float3* normal, uint2 normalSize) {
 	TICK();
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
         shared(out), private(y)
 	for (y = 0; y < normalSize.y; y++)
 		for (unsigned int x = 0; x < normalSize.x; x++) {
@@ -846,7 +1295,7 @@ void renderDepthKernel(uchar4* out, float * depth, uint2 depthSize,
 	float rangeScale = 1 / (farPlane - nearPlane);
 
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
         shared(out), private(y)
 	for (y = 0; y < depthSize.y; y++) {
 		int rowOffeset = y * depthSize.x;
@@ -873,7 +1322,7 @@ void renderTrackKernel(uchar4* out, const TrackData* data, uint2 outSize) {
 	TICK();
 
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
         shared(out), private(y)
 	for (y = 0; y < outSize.y; y++)
 		for (unsigned int x = 0; x < outSize.x; x++) {
@@ -911,7 +1360,7 @@ void renderVolumeKernel(uchar4* out, const uint2 depthSize, const Volume volume,
 		const float3 ambient) {
 	TICK();
 	unsigned int y;
-#pragma omp parallel for schedule(dynamic) \
+	#pragma omp parallel for \
         shared(out), private(y)
 	for (y = 0; y < depthSize.y; y++) {
 		for (unsigned int x = 0; x < depthSize.x; x++) {
@@ -943,9 +1392,9 @@ void renderVolumeKernel(uchar4* out, const uint2 depthSize, const Volume volume,
 bool Kfusion::preprocessing(const ushort * inputDepth, const uint2 inputSize) {
 
 	mm2metersKernel(floatDepth, computationSize, inputDepth, inputSize);
-	bilateralFilterKernel(ScaledDepth[0], floatDepth, computationSize, gaussian,
-			e_delta, radius);
 
+	bilateralFilterKernel(ScaledDepth[0], floatDepth, computationSize.x,computationSize.y, gaussian,
+			e_delta, radius);
 	return true;
 }
 
@@ -981,9 +1430,98 @@ bool Kfusion::tracking(float4 k, float icp_threshold, uint tracking_rate,
 				computationSize.y / (int) pow(2, level));
 		for (int i = 0; i < iterations[level]; ++i) {
 
-			trackKernel(trackingResult, inputVertex[level], inputNormal[level],
-					localimagesize, vertex, normal, computationSize, pose,
-					projectReference, dist_threshold, normal_threshold);
+			
+			pt_tr_in[0] = inVertex_buffer[level];
+			pt_tr_in[1] = inNormal_buffer[level];
+			pt_tr_in[2] = refVertex_buffer;
+			pt_tr_in[3] = refNormal_buffer;
+			pt_tr_in[4] = Ttrack_data_buffer;
+			pt_tr_in[5] = view_data_buffer;
+
+			pt_tr_out[0] = track_result_buffer;
+			pt_tr_out[1] = trackData_float_buffer;
+
+			int k;
+			#pragma omp parallel for
+			for (k = 0; k < computationSize.x * computationSize.y; k++) {
+				track_result_data[k] = trackingResult[k].result;
+				trackData_float[k*7] = trackingResult[k].error;
+				trackData_float[k*7+1] = trackingResult[k].J[0];
+				trackData_float[k*7+2] = trackingResult[k].J[1];
+				trackData_float[k*7+3] = trackingResult[k].J[2];
+				trackData_float[k*7+4] = trackingResult[k].J[3];
+				trackData_float[k*7+5] = trackingResult[k].J[4];
+				trackData_float[k*7+6] = trackingResult[k].J[5];
+			}
+
+			TICK();
+
+			#pragma omp parallel for
+			for (k = 0; k < 4; k ++) {
+				Ttrack_data[k*4] = pose.data[k].x;
+				Ttrack_data[k*4 + 1] = pose.data[k].y;
+				Ttrack_data[k*4 + 2] = pose.data[k].z;
+				Ttrack_data[k*4 + 3] = pose.data[k].w;
+
+				view_data[k*4] = projectReference.data[k].x;
+				view_data[k*4 + 1] = projectReference.data[k].y;
+				view_data[k*4 + 2] = projectReference.data[k].z;
+				view_data[k*4 + 3] = projectReference.data[k].w;
+			}
+
+			int argcounter = 0;
+
+			err = 0;
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &track_result_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &trackData_float_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &inVertex_buffer[level]);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &inNormal_buffer[level]);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(int), &localimagesize.x);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(int), &localimagesize.y);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &refVertex_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &refNormal_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(int), &computationSize.x);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(int), &computationSize.y);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &Ttrack_data_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(cl_mem), &view_data_buffer);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(float), &dist_threshold);
+			err |= clSetKernelArg(krnl_trackKernel,argcounter++, sizeof(float), &normal_threshold);
+			if (err != CL_SUCCESS) {
+				printf("Error: Failed to set krnl_trackKernel arguments! %d\n", err);
+		 
+		 	}
+			err = clEnqueueMigrateMemObjects(q,(cl_uint)6, pt_tr_in, 0 ,0,NULL, NULL);
+
+			
+			err = clEnqueueTask(q, krnl_trackKernel, 0, NULL, NULL);
+		    if (err) {
+		        printf("Error: Failed to execute track kernel! %d\n", err);
+		        return EXIT_FAILURE;
+		    }	
+		    
+			err = 0;
+			err |= clEnqueueMigrateMemObjects(q,(cl_uint)2, pt_tr_out, CL_MIGRATE_MEM_OBJECT_HOST,0,NULL, NULL);
+			if (err != CL_SUCCESS) {
+		        printf("Error: Failed to write to source array: %d!\n", err);
+		        return EXIT_FAILURE;
+		    }
+
+			clFinish(q);
+
+			TOCK("trackKernel", localimagesize.x * localimagesize.y);
+
+			#pragma omp parallel for
+			for (k = 0; k < computationSize.x * computationSize.y; k++) {
+				trackingResult[k].result = track_result_data[k];
+				trackingResult[k].error = trackData_float[k*7];
+				trackingResult[k].J[0] = trackData_float[k*7+1];
+				trackingResult[k].J[1] = trackData_float[k*7+2];
+				trackingResult[k].J[2] = trackData_float[k*7+3];
+				trackingResult[k].J[3] = trackData_float[k*7+4];
+				trackingResult[k].J[4] = trackData_float[k*7+5];
+				trackingResult[k].J[5] = trackData_float[k*7+6];
+			}
+
 
 			reduceKernel(reductionoutput, trackingResult, computationSize,
 					localimagesize);
@@ -1016,16 +1554,37 @@ bool Kfusion::raycasting(float4 k, float mu, uint frame) {
 bool Kfusion::integration(float4 k, uint integration_rate, float mu,
 		uint frame) {
 
+
+	double start1 = 0;
+	double total1 = 0;
+	double start2 = 0;
+	double total2 = 0;
+
+	start1 = tock();
+
 	bool doIntegrate = checkPoseKernel(pose, oldPose, reductionoutput,
 			computationSize, track_threshold);
 
 	if ((doIntegrate && ((frame % integration_rate) == 0)) || (frame <= 3)) {
 		integrateKernel(volume, floatDepth, computationSize, inverse(pose),
 				getCameraMatrix(k), mu, maxweight);
+
 		doIntegrate = true;
 	} else {
 		doIntegrate = false;
 	}
+
+	total1 = tock() - start1;
+
+
+	start2 = tock();
+	#pragma omp parallel for 
+	for(int i=0; i<=volume.size.x*volume.size.y*volume.size.z; i++){
+		volume.data[i].x=volume.data[i].x;
+		volume.data[i].y=volume.data[i].y;
+	}
+	total2 = tock() - start2;
+
 
 	return doIntegrate;
 

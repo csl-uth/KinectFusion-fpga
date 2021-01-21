@@ -11,7 +11,7 @@
 
  */
 
-#include <kernels.h>
+#include <kernels.hpp>
 #include <interface.h>
 #include <stdint.h>
 #include <vector>
@@ -27,41 +27,27 @@
 #include <iomanip>
 #include <getopt.h>
 
-
 inline double tock() {
 	synchroniseDevices();
-#ifdef __APPLE__
-		clock_serv_t cclock;
-		mach_timespec_t clockData;
-		host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &cclock);
-		clock_get_time(cclock, &clockData);
-		mach_port_deallocate(mach_task_self(), cclock);
-#else
-		struct timespec clockData;
-		clock_gettime(CLOCK_MONOTONIC, &clockData);
-#endif
-		return (double) clockData.tv_sec + clockData.tv_nsec / 1000000000.0;
+	struct timespec clockData;
+	clock_gettime(CLOCK_MONOTONIC, &clockData);
+	return (double) clockData.tv_sec + clockData.tv_nsec / 1000000000.0;
 }	
-
-
 
 /***
  * This program loop over a scene recording
  */
-
 int main(int argc, char ** argv) {
 
 	Configuration config(argc, argv);
 
 	// ========= CHECK ARGS =====================
-
 	std::ostream* logstream = &std::cout;
 	std::ofstream logfilestream;
 	assert(config.compute_size_ratio > 0);
 	assert(config.integration_rate > 0);
 	assert(config.volume_size.x > 0);
 	assert(config.volume_resolution.x > 0);
-
 	if (config.log_file != "") {
 		logfilestream.open(config.log_file.c_str());
 		logstream = &logfilestream;
@@ -71,6 +57,12 @@ int main(int argc, char ** argv) {
 		config.print_arguments();
 		exit(1);
 	}
+	if(config.binaryPath == ""){
+		std::cerr << "No xclbin found." << std::endl;
+		config.print_arguments();
+		exit(1);
+	}
+	std::string binaryFile = config.binaryPath;
 
 	// ========= READER INITIALIZATION  =========
 
@@ -93,8 +85,8 @@ int main(int argc, char ** argv) {
 	std::cerr << "input Size is = " << inputSize.x << "," << inputSize.y
 			<< std::endl;
 
-	//  =========  BASIC PARAMETERS  (input size / computation size )  =========
 
+	//  =========  BASIC PARAMETERS  (input size / computation size )  =========
 	const uint2 computationSize = make_uint2(
 			inputSize.x / config.compute_size_ratio,
 			inputSize.y / config.compute_size_ratio);
@@ -104,9 +96,11 @@ int main(int argc, char ** argv) {
 		camera = config.camera / config.compute_size_ratio;
 	//  =========  BASIC BUFFERS  (input / output )  =========
 
+
 	// Construction Scene reader and input buffer
 	uint16_t* inputDepth = (uint16_t*) malloc(
 			sizeof(uint16_t) * inputSize.x * inputSize.y);
+
 	uchar4* depthRender = (uchar4*) malloc(
 			sizeof(uchar4) * computationSize.x * computationSize.y);
 	uchar4* trackRender = (uchar4*) malloc(
@@ -115,19 +109,18 @@ int main(int argc, char ** argv) {
 			sizeof(uchar4) * computationSize.x * computationSize.y);
 
 	uint frame = 0;
-
 	Kfusion kfusion(computationSize, config.volume_resolution,
-			config.volume_size, init_pose, config.pyramid);
-
+			config.volume_size, init_pose, config.pyramid,binaryFile);
+		
 	double timings[7];
+	double startTS;
+	double endTS;
 	timings[0] = tock();
-
 
 	*logstream
 			<< "frame\tacquisition\tpreprocessing\ttracking\tintegration\traycasting\trendering\tcomputation\ttotal    \tX          \tY          \tZ         \ttracked   \tintegrated\tstartTS\tendTS"
 			<< std::endl;
 	logstream->setf(std::ios::fixed, std::ios::floatfield);
-
 	while (reader->readNextDepthFrame(inputDepth)) {
 
 		Matrix4 pose = kfusion.getPose();
@@ -156,10 +149,10 @@ int main(int argc, char ** argv) {
 
 		timings[5] = tock();
 
-		kfusion.renderDepth(depthRender, computationSize);
+		/*kfusion.renderDepth(depthRender, computationSize);
 		kfusion.renderTrack(trackRender, computationSize);
 		kfusion.renderVolume(volumeRender, computationSize, frame,
-				config.rendering_rate, camera, 0.75 * config.mu);
+				config.rendering_rate, camera, 0.75 * config.mu);*/
 
 		timings[6] = tock();
 
@@ -175,13 +168,13 @@ int main(int argc, char ** argv) {
 				<< tracked << "        \t" << integrated << "\t" // tracked and integrated flags
 				<< timings[0] << "\t" // frame start timestamp
 				<< timings[6] << "\t" // frame end timestamp
-
 				<< std::endl;
 
 		frame++;
-		std::cerr << "["<< frame << "] \r" << std::flush;
+		std::cout << "["<< frame << "] \r" << std::flush;
 
 		timings[0] = tock();
+
 	}
 	// ==========     DUMP VOLUME      =========
 
@@ -190,11 +183,12 @@ int main(int argc, char ** argv) {
 	}
 
 	//  =========  FREE BASIC BUFFERS  =========
-
 	free(inputDepth);
 	free(depthRender);
 	free(trackRender);
 	free(volumeRender);
-
+	
 	exit(0);
+
 }
+

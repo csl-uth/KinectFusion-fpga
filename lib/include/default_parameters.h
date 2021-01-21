@@ -40,7 +40,7 @@ const bool default_no_gui = false;
 const bool default_render_volume_fullsize = false;
 const std::string default_dump_volume_file = "";
 const std::string default_input_file = "";
-const std::string default_log_file = "";
+const std::string default_log_file = "test.log";
 
 inline std::string pyramid2str(std::vector<int> v) {
 	std::ostringstream ss;
@@ -50,7 +50,7 @@ inline std::string pyramid2str(std::vector<int> v) {
 
 }
 
-static std::string short_options = "qc:d:f:i:l:m:k:o:p:r:s:t:v:y:z:";
+static std::string short_options = "qc:d:f:i:l:m:k:o:p:r:s:t:v:y:z:x:";
 
 static struct option long_options[] =
   {
@@ -70,6 +70,7 @@ static struct option long_options[] =
 		    {"volume-resolution",      required_argument, 0, 'v'},
 		    {"pyramid-levels", 		   required_argument, 0, 'y'},
 		    {"rendering-rate", required_argument, 0, 'z'},
+		    {"xclbin", required_argument, 0, 'x'},
 		    {0, 0, 0, 0}
 
 };
@@ -91,6 +92,7 @@ struct Configuration {
 	std::string log_file;
 	std::ofstream log_filestream;
 	std::ostream *log_stream;
+	std::string binaryPath;
 
 	float4 camera;
 	bool camera_overrided;
@@ -119,6 +121,8 @@ struct Configuration {
 		std ::cerr << "-v  (--volume-resolution)        : default is " << default_volume_resolution.x << "," << default_volume_resolution.y << "," << default_volume_resolution.z << "    " << std::endl;
 		std ::cerr << "-y  (--pyramid-levels)           : default is 10,5,4     " << std::endl;
 		std ::cerr << "-z  (--rendering-rate)   : default is " << default_rendering_rate << std::endl;
+		std ::cerr << "-x  (--xclbin)   : required " << std::endl;
+
 	}
 	void print_values(std::ostream& out) {
 time_t rawtime;
@@ -306,6 +310,10 @@ time_t rawtime;
 							<< this->input_file << ")\n";
 					flagErr++;
 				}
+				break;
+			case 'x':
+				this->binaryPath = optarg;
+				std::cerr << "using xclbin from " << this->binaryPath << std::endl;
 				break;
 			case 'k':    //   -k  (--camera)
 				this->camera = atof4(optarg);

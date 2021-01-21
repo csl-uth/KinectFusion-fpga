@@ -118,7 +118,7 @@ struct KFusionConfig {
 		mu = 0.1f;
 		maxweight = 100.0f;
 
-		radius = 2;
+		radius = 1;
 		delta = 4.0f;
 		e_delta = 0.1f;
 

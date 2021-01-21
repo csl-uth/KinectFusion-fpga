@@ -40,9 +40,9 @@
 //External dependencies
 #undef isnan
 #undef isfinite
-#include <TooN/TooN.h>
-#include <TooN/se3.h>
-#include <TooN/GR_SVD.h>
+#include "TooN/TooN.h"
+#include "TooN/se3.h"
+#include "TooN/GR_SVD.h"
 
 ////////////////////////// MATh STUFF //////////////////////
 
@@ -300,10 +300,15 @@ struct Volume {
 				* (0.5f * 0.00003051944088f);
 	}
 
-	void init(uint3 s, float3 d) {
+	void init(uint3 s, float3 d,short2 *buffer) {
 		size = s;
 		dim = d;
-		data = (short2 *) malloc(size.x * size.y * size.z * sizeof(short2));
+		if (buffer == NULL) {
+			data = (short2 *) malloc(size.x * size.y * size.z * sizeof(short2));
+		}
+		else {
+			data = buffer;
+		}
 		assert(data != NULL);
 
 	}
@@ -336,6 +341,12 @@ inline __host__      __device__ float3 operator*(const Matrix4 & M,
 }
 
 inline float3 rotate(const Matrix4 & M, const float3 & v) {
+	return make_float3(dot(make_float3(M.data[0]), v),
+			dot(make_float3(M.data[1]), v), dot(make_float3(M.data[2]), v));
+}
+
+inline float3 rotate(const Matrix4 & M, const float4 & v4) {
+	float3 v = make_float3(v4.x, v4.y, v4.z);
 	return make_float3(dot(make_float3(M.data[0]), v),
 			dot(make_float3(M.data[1]), v), dot(make_float3(M.data[2]), v));
 }

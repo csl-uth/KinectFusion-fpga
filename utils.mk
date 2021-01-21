@@ -18,6 +18,11 @@ else
 	B_NAME = $(B_TEMP)/$(DEVICE)
 endif
 
+#Checks for XILINX_VITIS
+ifndef XILINX_VITIS
+$(error XILINX_VITIS variable is not set, please set correctly and rerun)
+endif
+
 #Checks for Device Family
 ifeq ($(HOST_ARCH), aarch32)
 	DEV_FAM = 7Series
@@ -25,6 +30,11 @@ else ifeq ($(HOST_ARCH), aarch64)
 	DEV_FAM = Ultrascale
 endif
 
+#Checks for XILINX_XRT
+check-xrt:
+ifndef XILINX_XRT
+	$(error XILINX_XRT variable is not set, please set correctly and rerun)
+endif
 
 #Checks for Correct architecture
 ifneq ($(HOST_ARCH), $(filter $(HOST_ARCH),aarch64 aarch32 x86))
