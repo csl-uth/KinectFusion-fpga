@@ -1,0 +1,21 @@
+KFusion valid frames ,882
+KFusion dropped frames ,0
+KFusion result: ,880
+NUIM  result,880
+Working position is :,880
+Untracked frames:,0
+,
+,[ms]
+acquisition,0.4537619048
+preprocessing,40.5296179138
+tracking,38.9374795918
+integration,215.2167619048
+raycasting,125.3279387755
+rendering,33.6309297052
+total,420.4655612245
+,
+,[m]
+ATE TOTAL,18.0690313276
+ATE MIN,0
+ATE MAX,0.0491405774
+ATE MEAN,0.0205329901
